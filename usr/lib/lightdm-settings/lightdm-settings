@@ -281,6 +281,16 @@ class Application(Gtk.Application):
             row.set_tooltip_text(_("Show the login window on Wayland, in Muffin, with the display settings (arrangement, resolution, refresh rate, scale and HDR) of the user who logged in last, or else the most recently saved ones for the connected monitors. HDR monitors keep their HDR mode between the login window and an HDR desktop."))
             section.add_row(row)
 
+            # (Only with a slick-greeter that knows the setting)
+            schema = settings.get_property("settings-schema")
+            if schema is not None and schema.has_key("sdr-edid-colors"):
+                colors_switch = SettingsSwitch(keyfile, settings, "sdr-edid-colors")
+                row = SettingsRow(Gtk.Label(label=_("Accurate colors on wide gamut monitors")), colors_switch)
+                row.set_tooltip_text(_("On monitors that cover a wider gamut than sRGB, show colors in the login window as they are meant to look instead of stretched over the monitor's gamut (oversaturated), as on a desktop that does the same (MUFFIN_SDR_EDID_COLORS=1). Matching the desktop also keeps the colors from changing when you log in."))
+                wayland_switch.bind_property("active", row, "sensitive",
+                                             GObject.BindingFlags.SYNC_CREATE)
+                section.add_row(row)
+
         section = page.add_section(_("Panel indicators"))
 
         row = SettingsRow(Gtk.Label(label=_("Hostname")), SettingsSwitch(keyfile, settings, "show-hostname"))
