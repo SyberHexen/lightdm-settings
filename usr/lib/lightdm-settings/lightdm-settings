@@ -7,6 +7,7 @@ import gettext
 import sys
 import glob
 import subprocess, binascii
+import shutil
 from SettingsWidgets import *
 
 gi.require_version('Gtk', '3.0')
@@ -19,6 +20,14 @@ gettext.install("lightdm-settings", "/usr/share/locale")
 CONF_PATH = "/etc/lightdm/slick-greeter.conf"
 LIGHTDM_CONF_PATH = "/etc/lightdm/lightdm.conf"
 LIGHTDM_GROUP_NAMES = ["SeatDefaults", "Seat:*"]
+
+# The Wayland login window: slick-greeter in Muffin (see slick-greeter-wayland)
+GREETER_X11 = "lightdm-slick-greeter"
+GREETER_WAYLAND = "lightdm-slick-greeter-wayland"
+GREETER_WAYLAND_DESKTOP = "/usr/share/xgreeters/%s.desktop" % GREETER_WAYLAND
+# Run as root before each Wayland login window: gives it the users' display
+# settings (see slick-greeter-wayland-setup)
+GREETER_WAYLAND_SETUP = "/usr/bin/slick-greeter-wayland-setup"
 
 class Application(Gtk.Application):
     ''' Create the UI '''
@@ -114,6 +123,7 @@ class Application(Gtk.Application):
 
         # LightDM settings
         lightdm_keyfile = GLib.KeyFile()
+        self.lightdm_keyfile = lightdm_keyfile
         try:
             lightdm_keyfile.load_from_file(LIGHTDM_CONF_PATH, GLib.KeyFileFlags.KEEP_COMMENTS)
         except Exception:
@@ -235,7 +245,8 @@ class Application(Gtk.Application):
         section = page.add_section(_("Settings"))
 
         row = SettingsRow(Gtk.Label(label=_("Activate numlock")), SettingsSwitch(keyfile, settings, "activate-numlock"))
-        if (not os.path.exists("/usr/bin/numlockx")):
+        # (On Wayland the compositor sets numlock: no numlockx needed)
+        if (not os.path.exists("/usr/bin/numlockx") and not self.uses_wayland_greeter()):
             row.set_sensitive(False)
             # Set button to OFF state.
             row.main_widget.set_active(False)
@@ -259,6 +270,16 @@ class Application(Gtk.Application):
         row = SettingsRow(Gtk.Label(label=_("Monitor")), SettingsCombo(keyfile, settings, "only-on-monitor", monitors, "string", size_group))
         row.set_tooltip_text(_("Choose which monitor should display the login window, or select 'Auto' if you want it to follow the mouse."))
         section.add_row(row)
+
+        if self.can_use_wayland_greeter():
+            section = page.add_section(_("Wayland"))
+
+            wayland_switch = Gtk.Switch()
+            wayland_switch.set_active(self.uses_wayland_greeter())
+            wayland_switch.connect("notify::active", self.on_wayland_toggled)
+            row = SettingsRow(Gtk.Label(label=_("Use Wayland") + " *"), wayland_switch)
+            row.set_tooltip_text(_("Show the login window on Wayland, in Muffin, with the display settings (arrangement, resolution, refresh rate, scale and HDR) of the user who logged in last, or else the most recently saved ones for the connected monitors. HDR monitors keep their HDR mode between the login window and an HDR desktop."))
+            section.add_row(row)
 
         section = page.add_section(_("Panel indicators"))
 
@@ -311,6 +332,11 @@ class Application(Gtk.Application):
         section.add_row(row)
 
         clock_switch.bind_property("active", row, "sensitive", GObject.BindingFlags.DEFAULT | GObject.BindingFlags.SYNC_CREATE)
+
+        # (LightDM reads its configuration when it starts, as for the Users page)
+        if self.can_use_wayland_greeter():
+            description = Gtk.Label(label="* " + _("These settings require a computer reboot to take effect."))
+            page.pack_start(description, False, False, 0)
 
         self.window.add(self.main_box)
 
@@ -470,7 +496,61 @@ class Application(Gtk.Application):
                         pass
         return (value)
 
+    def can_use_wayland_greeter(self):
+        return os.path.exists(GREETER_WAYLAND_DESKTOP) and shutil.which("muffin") is not None
+
+    def uses_wayland_greeter(self):
+        return self.get_lightdm_config("greeter-session", GREETER_X11) == GREETER_WAYLAND
+
+    def on_wayland_toggled(self, switch, pspec):
+        wayland = switch.get_active()
+        group = LIGHTDM_GROUP_NAMES[1]
+        self.lightdm_keyfile.set_string(group, "greeter-session",
+                                        GREETER_WAYLAND if wayland else GREETER_X11)
+        # Keep a setup script of the administrator's own
+        setup = self.get_lightdm_config("greeter-setup-script", "")
+        if wayland and setup in ("", GREETER_WAYLAND_SETUP):
+            self.lightdm_keyfile.set_string(group, "greeter-setup-script", GREETER_WAYLAND_SETUP)
+        elif not wayland and setup == GREETER_WAYLAND_SETUP:
+            try:
+                self.lightdm_keyfile.remove_key(group, "greeter-setup-script")
+            except GLib.Error:
+                pass
+        self.lightdm_keyfile.save_to_file(LIGHTDM_CONF_PATH)
+        # The lightdm user's services (D-Bus, dconf) kept running between
+        # logins: the login window shows up sooner after logging out
+        try:
+            subprocess.run(["loginctl", "enable-linger" if wayland else "disable-linger", "lightdm"],
+                           check=False, timeout=10)
+        except Exception as e:
+            print(e)
+
+    def get_drm_monitors(self):
+        """ The connected monitors by connector name (DP-1) and the name in
+            their EDID, as the Wayland login window matches them """
+        monitors = []
+        for path in sorted(glob.glob("/sys/class/drm/card*-*")):
+            try:
+                with open(os.path.join(path, "status")) as f:
+                    if f.read().strip() != "connected":
+                        continue
+                connector = os.path.basename(path).split("-", 1)[1]
+                name = None
+                with open(os.path.join(path, "edid"), "rb") as f:
+                    edid = f.read()
+                for offset in range(54, 109, 18):
+                    if edid[offset:offset + 4] == b"\x00\x00\x00\xfc":
+                        name = edid[offset + 5:offset + 18].split(b"\n")[0].decode(errors="replace").strip()
+                        break
+                monitors.append([connector, "%s (%s)" % (connector, name) if name else connector])
+            except Exception as e:
+                print(e)
+        return monitors
+
     def get_monitors(self):
+        if self.uses_wayland_greeter():
+            return self.get_drm_monitors()
+
         monitors = []
 
         # Gather monitor names from Xrandr
